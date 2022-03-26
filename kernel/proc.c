@@ -6,6 +6,9 @@
 #include "proc.h"
 #include "defs.h"
 
+extern char etext[];  // kernel.ld sets this to end of kernel code.
+
+extern char trampoline[]; // trampoline.S
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -34,14 +37,14 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
-      if(pa == 0)
-        panic("kalloc");
-      uint64 va = KSTACK((int) (p - proc));
-      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
-  }
-  kvminithart();
+//      char *pa = kalloc();
+//      if(pa == 0)
+//        panic("kalloc");
+//     uint64 va = KSTACK((int) (p - proc));
+//      kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+//      p->kstack = va;
+   }
+//  kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -112,7 +115,7 @@ found:
     release(&p->lock);
     return 0;
   }
-
+  
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -120,8 +123,14 @@ found:
     release(&p->lock);
     return 0;
   }
-
-  // Set up new context to start executing at forkret,
+  p->kpagetable=kvminit2();
+  char *pa = kalloc();
+  if(pa == 0)
+    panic("kalloc");
+  uint64 va = TRAMPOLINE - 2*PGSIZE;
+  mappages(p->kpagetable,va, PGSIZE,(uint64)pa, PTE_R | PTE_W);
+  p->kstack = va;
+//  // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
@@ -130,6 +139,17 @@ found:
   return p;
 }
 
+void freekernelpage(pagetable_t kpagetable){
+  uvmunmap(kpagetable, TRAMPOLINE-2*PGSIZE, 1, 1);
+  uvmunmap(kpagetable,UART0, 1,0 );
+  uvmunmap(kpagetable,VIRTIO0, 1,0);
+//  uvmunmap(kpagetable,CLINT, 0x10000/PGSIZE,0);
+  uvmunmap(kpagetable,PLIC, 0x400000/PGSIZE,0);
+  uvmunmap(kpagetable,KERNBASE, ((uint64)etext-KERNBASE)/PGSIZE,0);
+  uvmunmap(kpagetable,(uint64)etext, (PHYSTOP-(uint64)etext)/PGSIZE,0);
+  uvmunmap(kpagetable,TRAMPOLINE, 1,0);
+  freewalk(kpagetable);
+}
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -139,6 +159,10 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->kpagetable){
+    freekernelpage(p->kpagetable);
+    p->kpagetable=0;
+  }
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -473,12 +497,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
-        swtch(&c->context, &p->context);
-
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
+        swtch(&c->context, &p->context); 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        kvminithart();
         c->proc = 0;
-
         found = 1;
       }
       release(&p->lock);
